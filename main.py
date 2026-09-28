@@ -1,6 +1,3 @@
-# `main.py`
-
-```python
 import os
 import re
 import sqlite3
@@ -169,4 +166,3 @@ async def landing_page() -> str:
     </body>
     </html>
     """
-```
