@@ -1,0 +1,10 @@
+{
+  "name": "auditguard",
+  "version": "0.1.0",
+  "description": "JavaScript client for AuditGuard prompt security API",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "keywords": ["llm", "security", "pii", "prompt-injection"],
+  "license": "MIT"
+}
