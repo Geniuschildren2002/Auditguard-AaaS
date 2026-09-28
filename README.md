@@ -11,6 +11,10 @@ AuditGuard is a FastAPI service for PII redaction and prompt-injection defense.
 - Plans: `GET /v1/plans`
 - Industries: `GET /v1/industries`
 - Transparent local benchmark: `GET /v1/benchmark`
+- Interactive security audit: `POST /v1/security/audit`
+- Free PII playground: `/playground`
+- Local leaked-key radar: `POST /v1/security/leaked-key-check`
+- Feedback loop: `POST /v1/feedback`
 
 ## SDKs
 
@@ -18,4 +22,4 @@ Publish-ready Python and JavaScript SDK source packages are in [`sdks/`](sdks/).
 
 ## Safety notes
 
-Payment endpoints expose plan metadata only. API keys are not issued from an arbitrary transaction hash; on-chain verification must be implemented before production activation. External marketing messages and public benchmark claims are not automated.
+Payment endpoints expose plan metadata only. API keys are not issued from an arbitrary transaction hash; on-chain verification and automatic transfers are not enabled. The model failover is optional and requires a user-supplied `GROQ_API_KEY`. External marketing messages, GitHub scans and public benchmark claims are not automated; the leaked-key radar accepts supplied text only.

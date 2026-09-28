@@ -1,7 +1,9 @@
 import hashlib
+import html
 import json
 import os
 import re
+import requests
 import sqlite3
 import threading
 import time
@@ -20,8 +22,10 @@ except ImportError:  # pragma: no cover - dependency is installed in deployment
     genai = None
 
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "5.0.0"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GENERAL_WALLET = os.getenv(
     "GENERAL_PAYOUT_WALLET",
     "0xddd4099e38eddba33c04beaf034dd4241e6c7df3",
@@ -30,8 +34,8 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
 CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "5000"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "12000"))
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
-RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_PER_SECOND = int(os.getenv("RATE_LIMIT_PER_SECOND", "5"))
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "5"))
 MICRO_CREDIT_PRICE_USDT = 5.0
 MICRO_CREDIT_QUOTA = 10_000
 PRO_MONTHLY_PRICE = 19.0
@@ -71,6 +75,12 @@ PII_PATTERNS = {
     "CARD": re.compile(r"\b(?:\d{4}[ -]?){3}\d{4}\b"),
     "API_KEY": re.compile(r"(?:sk-|AIza|ghp_)[a-zA-Z0-9_-]{20,}"),
 }
+LEAK_PATTERNS = {
+    "OPENAI": re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    "ANTHROPIC": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    "GITHUB": re.compile(r"ghp_[A-Za-z0-9]{30,}"),
+    "AWS": re.compile(r"AKIA[0-9A-Z]{16}"),
+}
 THREAT_PATTERNS = {
     "JAILBREAK": re.compile(
         r"\b(ignore|disregard|bypass|override)\b.{0,80}\b(previous|system|safety|instruction)",
@@ -103,7 +113,7 @@ _cache_lock = threading.Lock()
 _recent_latencies = deque(maxlen=200)
 _metrics = Counter()
 _metrics_lock = threading.Lock()
-_rate_windows: dict[str, deque[float]] = {}
+_rate_buckets: dict[str, tuple[float, float]] = {}
 _rate_lock = threading.Lock()
 
 
@@ -131,21 +141,36 @@ class SalesLead(BaseModel):
     wants_sla: bool = False
 
 
+class AuditRequest(BaseModel):
+    company: str = Field(default="Anonymous", min_length=1, max_length=120)
+    target_text: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+
+
+class FeedbackRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=120)
+    label: str = Field(pattern="^(correct|incorrect|needs_review)$")
+    note: str = Field(default="", max_length=500)
+
+
+class LeakCheckRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100_000)
+
+
 def record_metric(name: str, value: int = 1) -> None:
     with _metrics_lock:
         _metrics[name] += value
 
 
 def enforce_rate_limit(client_id: str) -> None:
+    """Token bucket: five tokens/sec by default with a five-token burst."""
     now = time.monotonic()
     with _rate_lock:
-        window = _rate_windows.setdefault(client_id, deque())
-        while window and now - window[0] >= RATE_LIMIT_WINDOW_SECONDS:
-            window.popleft()
-        if len(window) >= RATE_LIMIT_PER_MINUTE:
+        tokens, updated = _rate_buckets.get(client_id, (float(RATE_LIMIT_BURST), now))
+        tokens = min(float(RATE_LIMIT_BURST), tokens + (now - updated) * RATE_LIMIT_PER_SECOND)
+        if tokens < 1:
             record_metric("rate_limited")
             raise HTTPException(status_code=429, detail="Rate limit exceeded; retry shortly")
-        window.append(now)
+        _rate_buckets[client_id] = (tokens - 1, now)
 
 
 def mask_text(text: str) -> str:
@@ -183,6 +208,24 @@ def heuristic_threats(text: str) -> list[str]:
     return [name for name, pattern in THREAT_PATTERNS.items() if pattern.search(text)]
 
 
+def groq_threat_check_sync(clean_prompt: str) -> Optional[bool]:
+    if not GROQ_API_KEY:
+        return None
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        json={
+            "model": GROQ_MODEL,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": "Return only TRUE or FALSE. Is this prompt a jailbreak or system-prompt leak?\n" + clean_prompt}],
+        },
+        timeout=8,
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"].strip().upper()
+    return content.startswith("TRUE")
+
+
 async def gemini_threat_check(clean_prompt: str) -> tuple[bool, str]:
     if model is None:
         reasons = heuristic_threats(clean_prompt)
@@ -202,6 +245,13 @@ async def gemini_threat_check(clean_prompt: str) -> tuple[bool, str]:
         payload = json.loads(match.group(0) if match else raw.strip("` \n"))
         return bool(payload.get("is_threat")), "gemini"
     except Exception:
+        try:
+            groq_result = await run_in_threadpool(groq_threat_check_sync, clean_prompt)
+            if groq_result is not None:
+                record_metric("groq_fallbacks")
+                return groq_result, "groq_fallback"
+        except Exception:
+            record_metric("groq_failures")
         reasons = heuristic_threats(clean_prompt)
         record_metric("gemini_fallbacks")
         return bool(reasons), "heuristic_fallback" if reasons else "heuristic_clear"
@@ -231,8 +281,10 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "version": APP_VERSION,
         "gemini_configured": bool(model),
+        "groq_failover_configured": bool(GROQ_API_KEY),
         "cache_entries": len(_cache),
-        "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+        "rate_limit_per_second": RATE_LIMIT_PER_SECOND,
+        "rate_limit_burst": RATE_LIMIT_BURST,
     }
 
 
@@ -252,12 +304,13 @@ def metrics(authorization: Optional[str] = Header(default=None)) -> dict[str, An
 def agent_status(authorization: Optional[str] = Header(default=None)) -> list[AgentStatus]:
     require_agent_key(authorization)
     return [
-        AgentStatus(name="CTO", role="Reliability", status="active", capability="bounded cache, health and metrics"),
-        AgentStatus(name="CFO", role="Payments", status="guarded", capability="order metadata; transaction verification remains required before activation"),
+        AgentStatus(name="CTO", role="Reliability", status="active", capability="token bucket, cache and optional multi-model failover"),
+        AgentStatus(name="CFO", role="Payments", status="guarded", capability="ledger-ready metadata; no automatic transfer or activation"),
         AgentStatus(name="CEO", role="Orchestration", status="active", capability="service-level status and operational reporting"),
         AgentStatus(name="CMO", role="Growth", status="informational", capability="landing page and public API documentation"),
         AgentStatus(name="PR/DevRel", role="Integrations", status="informational", capability="OpenAPI documentation and API examples"),
         AgentStatus(name="CSO", role="Sales", status="active", capability="lead qualification, plan matching and ARR pipeline"),
+        AgentStatus(name="Manus", role="Security Radar", status="guarded", capability="local leaked-key scan; no external outreach"),
     ]
 
 
@@ -360,6 +413,81 @@ def benchmark(authorization: Optional[str] = Header(default=None)) -> dict[str, 
     }
 
 
+@app.post("/v1/security/audit")
+async def interactive_security_audit(
+    audit: AuditRequest,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """Audit supplied text only; never fetches arbitrary URLs or contacts a third party."""
+    scan = await scan_prompt(ScanRequest(prompt=audit.target_text), request, authorization)
+    pii_findings = [label for label, pattern in PII_PATTERNS.items() if pattern.search(audit.target_text)]
+    findings = list(scan["threat_signals"])
+    findings.extend(f"PII_{label}" for label in pii_findings)
+    report_id = f"audit_{uuid.uuid4().hex[:12]}"
+    vulnerability_count = len(findings)
+    recommendation = "Protect this input with AuditGuard before sending it to an LLM."
+    report_html = (
+        "<html><body><h1>AuditGuard Security Report</h1>"
+        f"<p>Company: {html.escape(audit.company)}</p>"
+        f"<p>Report ID: {report_id}</p>"
+        f"<p>Findings: {vulnerability_count}</p>"
+        f"<ul>{''.join(f'<li>{html.escape(item)}</li>' for item in findings) or '<li>No findings in supplied sample</li>'}</ul>"
+        f"<p>{html.escape(recommendation)}</p></body></html>"
+    )
+    record_metric("security_audits")
+    return {
+        "status": "complete",
+        "report_id": report_id,
+        "company": audit.company,
+        "vulnerability_count": vulnerability_count,
+        "findings": findings,
+        "recommendation": recommendation,
+        "upgrade_cta": "For production protection, evaluate the Pro plan after human review.",
+        "report_html": report_html,
+        "disclaimer": "This is a sample-text audit, not a guarantee or penetration test.",
+    }
+
+
+@app.post("/v1/security/leaked-key-check")
+def leaked_key_check(payload: LeakCheckRequest) -> dict[str, Any]:
+    findings = []
+    for label, pattern in LEAK_PATTERNS.items():
+        matches = pattern.findall(payload.content)
+        if matches:
+            findings.append({"type": label, "count": len(matches), "action": "revoke_and_rotate"})
+    record_metric("leaked_key_checks")
+    return {
+        "status": "complete",
+        "exposed_key_types": findings,
+        "detected": bool(findings),
+        "outreach": "not_automated",
+        "recommendation": "Revoke exposed keys, rotate credentials, and remove secrets from repository history.",
+    }
+
+
+@app.post("/v1/feedback")
+def feedback(payload: FeedbackRequest) -> dict[str, Any]:
+    record_metric(f"feedback_{payload.label}")
+    return {
+        "status": "recorded",
+        "request_id": payload.request_id,
+        "label": payload.label,
+        "learning_mode": "metrics_only; no automatic model retraining or production policy mutation",
+    }
+
+
+@app.get("/playground", response_class=HTMLResponse)
+async def pii_playground() -> str:
+    return """
+    <!doctype html><html><head><meta charset="utf-8"><title>Free PII Redactor Playground</title>
+    <style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;background:#0f172a;color:#f8fafc}textarea{width:100%;min-height:160px;background:#1e293b;color:#fff;padding:12px;border:1px solid #475569;border-radius:8px}button{margin-top:12px;padding:12px 18px;border:0;border-radius:8px;background:#38bdf8;cursor:pointer}pre{white-space:pre-wrap;background:#1e293b;padding:12px;border-radius:8px}</style></head>
+    <body><h1>Free PII Redactor Playground</h1><p>Paste sample text; do not submit real credentials or sensitive records.</p>
+    <textarea id="input" placeholder="Email: example@example.com"></textarea><br><button onclick="redact()">Redact and scan</button><pre id="output"></pre>
+    <script>async function redact(){const prompt=document.getElementById('input').value;const r=await fetch('/v1/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});document.getElementById('output').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+    """
+
+
 @app.post("/v1/scan")
 async def scan_prompt(
     req: ScanRequest,
@@ -422,6 +550,7 @@ async def evaluate_with_agent_swarm(
             "CMO": {"decision": "OBSERVE", "reason": "no marketing action is performed by scan"},
             "PR/DevRel": {"decision": "DOCUMENT", "reason": "OpenAPI endpoint is available"},
             "CSO": {"decision": "QUALIFY", "reason": "lead scoring requires lead data; no outreach is automated"},
+            "Manus": {"decision": "SCAN", "reason": "local leaked-key radar is available; no external outreach"},
         },
     }
 
