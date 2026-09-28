@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -6,11 +7,12 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 try:
     import google.generativeai as genai
@@ -18,7 +20,7 @@ except ImportError:  # pragma: no cover - dependency is installed in deployment
     genai = None
 
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GENERAL_WALLET = os.getenv(
     "GENERAL_PAYOUT_WALLET",
@@ -28,6 +30,8 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
 CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "5000"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "12000"))
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+RATE_LIMIT_WINDOW_SECONDS = 60
 
 if genai is not None and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -83,6 +87,8 @@ _cache_lock = threading.Lock()
 _recent_latencies = deque(maxlen=200)
 _metrics = Counter()
 _metrics_lock = threading.Lock()
+_rate_windows: dict[str, deque[float]] = {}
+_rate_lock = threading.Lock()
 
 
 class ScanRequest(BaseModel):
@@ -96,9 +102,25 @@ class AgentStatus(BaseModel):
     capability: str
 
 
+class AgentEvaluation(BaseModel):
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+
+
 def record_metric(name: str, value: int = 1) -> None:
     with _metrics_lock:
         _metrics[name] += value
+
+
+def enforce_rate_limit(client_id: str) -> None:
+    now = time.monotonic()
+    with _rate_lock:
+        window = _rate_windows.setdefault(client_id, deque())
+        while window and now - window[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            window.popleft()
+        if len(window) >= RATE_LIMIT_PER_MINUTE:
+            record_metric("rate_limited")
+            raise HTTPException(status_code=429, detail="Rate limit exceeded; retry shortly")
+        window.append(now)
 
 
 def mask_text(text: str) -> str:
@@ -136,7 +158,7 @@ def heuristic_threats(text: str) -> list[str]:
     return [name for name, pattern in THREAT_PATTERNS.items() if pattern.search(text)]
 
 
-def gemini_threat_check(clean_prompt: str) -> tuple[bool, str]:
+async def gemini_threat_check(clean_prompt: str) -> tuple[bool, str]:
     if model is None:
         reasons = heuristic_threats(clean_prompt)
         return bool(reasons), "heuristic" if reasons else "heuristic_clear"
@@ -148,10 +170,12 @@ def gemini_threat_check(clean_prompt: str) -> tuple[bool, str]:
         f"\nPrompt: {clean_prompt}"
     )
     try:
-        result = model.generate_content(eval_prompt)
-        raw = result.text.upper()
-        is_threat = "TRUE" in raw and "IS_THREAT" in raw
-        return is_threat, "gemini"
+        # The SDK call is synchronous; run it outside the event loop.
+        result = await run_in_threadpool(model.generate_content, eval_prompt)
+        raw = result.text.strip()
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        payload = json.loads(match.group(0) if match else raw.strip("` \n"))
+        return bool(payload.get("is_threat")), "gemini"
     except Exception:
         reasons = heuristic_threats(clean_prompt)
         record_metric("gemini_fallbacks")
@@ -166,6 +190,16 @@ def require_agent_key(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Valid API key required")
 
 
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -173,6 +207,7 @@ def health() -> dict[str, Any]:
         "version": APP_VERSION,
         "gemini_configured": bool(model),
         "cache_entries": len(_cache),
+        "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
     }
 
 
@@ -202,9 +237,12 @@ def agent_status(authorization: Optional[str] = Header(default=None)) -> list[Ag
 
 @app.post("/v1/scan")
 async def scan_prompt(
-    req: ScanRequest, authorization: Optional[str] = Header(default=None)
+    req: ScanRequest,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_agent_key(authorization)
+    enforce_rate_limit(request.client.host if request.client else "unknown")
     started = time.perf_counter()
     clean = mask_text(req.prompt)
     key = cache_key(clean)
@@ -217,7 +255,7 @@ async def scan_prompt(
         return cached
 
     threat_reasons = heuristic_threats(clean)
-    is_threat, engine = gemini_threat_check(clean)
+    is_threat, engine = await gemini_threat_check(clean)
     if threat_reasons and engine.startswith("gemini"):
         is_threat = True
     result = {
@@ -236,6 +274,30 @@ async def scan_prompt(
     record_metric("scans_total")
     record_metric("threats_blocked" if is_threat else "prompts_allowed")
     return result
+
+
+@app.post("/v1/agents/evaluate")
+async def evaluate_with_agent_swarm(
+    req: AgentEvaluation,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """Run the security decision once and expose a deterministic multi-agent view."""
+    scan = await scan_prompt(ScanRequest(prompt=req.prompt), request, authorization)
+    threat = bool(scan["is_threat"])
+    return {
+        "status": "success",
+        "request_id": request.headers.get("x-request-id"),
+        "decision": "BLOCK" if threat else "ALLOW",
+        "security": scan,
+        "agents": {
+            "CTO": {"decision": "BLOCK" if threat else "PASS", "reason": "security policy evaluation"},
+            "CEO": {"decision": "BLOCK" if threat else "ALLOW", "reason": "orchestrated final decision"},
+            "CFO": {"decision": "HOLD", "reason": "no payment action is performed by scan"},
+            "CMO": {"decision": "OBSERVE", "reason": "no marketing action is performed by scan"},
+            "PR/DevRel": {"decision": "DOCUMENT", "reason": "OpenAPI endpoint is available"},
+        },
+    }
 
 
 @app.post("/v1/order-pro")
