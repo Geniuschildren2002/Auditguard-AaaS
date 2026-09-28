@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -9,6 +10,7 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -22,10 +24,17 @@ except ImportError:  # pragma: no cover - dependency is installed in deployment
     genai = None
 
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.0.1"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.bnbchain.org")
+BSC_USDT_CONTRACT = os.getenv("BSC_USDT_CONTRACT", "0x55d398326f99059fF775485246999027B3197955")
+PAYMENT_TOKEN_DECIMALS = int(os.getenv("PAYMENT_TOKEN_DECIMALS", "18"))
+PAYMENT_CONFIRMATIONS_REQUIRED = int(os.getenv("PAYMENT_CONFIRMATIONS_REQUIRED", "3"))
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 GENERAL_WALLET = os.getenv(
     "GENERAL_PAYOUT_WALLET",
     "0xddd4099e38eddba33c04beaf034dd4241e6c7df3",
@@ -68,6 +77,18 @@ conn.execute(
 )
 conn.commit()
 db_lock = threading.Lock()
+conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS payment_verifications (
+        tx_hash TEXT PRIMARY KEY,
+        buyer_wallet TEXT NOT NULL,
+        plan TEXT NOT NULL,
+        amount_usdt TEXT NOT NULL,
+        verified_at INTEGER NOT NULL
+    )
+    """
+)
+conn.commit()
 
 PII_PATTERNS = {
     "EMAIL": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
@@ -154,6 +175,16 @@ class FeedbackRequest(BaseModel):
 
 class LeakCheckRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
+
+
+class PaymentVerificationRequest(BaseModel):
+    tx_hash: str = Field(pattern=r"^0x[a-fA-F0-9]{64}$")
+    buyer_wallet: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    plan: str = Field(pattern="^(micro|pro)$")
+
+
+class BinanceBalanceRequest(BaseModel):
+    asset: Optional[str] = Field(default=None, pattern=r"^[A-Z0-9]{2,20}$")
 
 
 def record_metric(name: str, value: int = 1) -> None:
@@ -263,6 +294,87 @@ def require_agent_key(authorization: Optional[str]) -> None:
     supplied = (authorization or "").removeprefix("Bearer ").strip()
     if supplied != AGENT_API_KEY:
         raise HTTPException(status_code=401, detail="Valid API key required")
+
+
+def bsc_rpc(method: str, params: list[Any]) -> Any:
+    response = requests.post(
+        BSC_RPC_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(payload["error"].get("message", "BSC RPC error"))
+    return payload.get("result")
+
+
+def verify_bsc_payment_sync(tx_hash: str, buyer_wallet: str, expected_amount: Decimal) -> dict[str, Any]:
+    receipt = bsc_rpc("eth_getTransactionReceipt", [tx_hash])
+    if not receipt:
+        return {"verified": False, "status": "pending_or_not_found", "tx_hash": tx_hash}
+    if receipt.get("status") != "0x1":
+        return {"verified": False, "status": "failed", "tx_hash": tx_hash}
+    block_hex = receipt.get("blockNumber")
+    if not block_hex:
+        return {"verified": False, "status": "pending", "tx_hash": tx_hash}
+    latest = int(bsc_rpc("eth_blockNumber", []), 16)
+    confirmations = latest - int(block_hex, 16) + 1
+    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    expected_recipient = GENERAL_WALLET.lower().replace("0x", "").zfill(64)
+    expected_sender = buyer_wallet.lower().replace("0x", "").zfill(64)
+    required_units = int(expected_amount * (Decimal(10) ** PAYMENT_TOKEN_DECIMALS))
+    matched_amount = 0
+    matched_sender = None
+    for log in receipt.get("logs", []):
+        topics = log.get("topics", [])
+        if log.get("address", "").lower() != BSC_USDT_CONTRACT.lower():
+            continue
+        if len(topics) < 3 or topics[0].lower() != transfer_topic:
+            continue
+        if topics[2].lower().replace("0x", "").zfill(64) != expected_recipient:
+            continue
+        if topics[1].lower().replace("0x", "").zfill(64) != expected_sender:
+            continue
+        matched_amount += int(log.get("data", "0x0"), 16)
+        matched_sender = "0x" + topics[1][-40:]
+    paid_amount = Decimal(matched_amount) / (Decimal(10) ** PAYMENT_TOKEN_DECIMALS)
+    verified = confirmations >= PAYMENT_CONFIRMATIONS_REQUIRED and matched_amount >= required_units
+    return {
+        "verified": verified,
+        "status": "verified" if verified else "insufficient_or_unconfirmed",
+        "tx_hash": tx_hash,
+        "confirmations": confirmations,
+        "required_confirmations": PAYMENT_CONFIRMATIONS_REQUIRED,
+        "paid_amount_usdt": str(paid_amount),
+        "required_amount_usdt": str(expected_amount),
+        "buyer_wallet": matched_sender or buyer_wallet,
+        "recipient_wallet": GENERAL_WALLET,
+        "token_contract": BSC_USDT_CONTRACT,
+        "network": "BEP-20 (BNB Smart Chain)",
+    }
+
+
+def binance_balances_sync(asset: Optional[str] = None) -> dict[str, Any]:
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        return {"configured": False, "status": "credentials_not_configured", "balances": []}
+    timestamp = int(time.time() * 1000)
+    query = f"timestamp={timestamp}&recvWindow=5000"
+    signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    response = requests.get(
+        f"{BINANCE_BASE_URL.rstrip('/')}/api/v3/account?{query}&signature={signature}",
+        headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+        timeout=12,
+    )
+    response.raise_for_status()
+    raw_balances = response.json().get("balances", [])
+    balances = [
+        {"asset": item["asset"], "free": item["free"], "locked": item["locked"]}
+        for item in raw_balances
+        if (asset is None or item["asset"] == asset)
+        and (Decimal(item["free"]) != 0 or Decimal(item["locked"]) != 0)
+    ]
+    return {"configured": True, "status": "ok", "balances": balances, "read_only": True}
 
 
 @app.middleware("http")
@@ -563,7 +675,7 @@ async def create_order(buyer_wallet: str) -> dict[str, Any]:
         "pay_to_address": GENERAL_WALLET,
         "buyer_wallet": buyer_wallet,
         "instructions": "O'tkazma bajargach, tx_hash bilan /v1/activate-key endpointiga murojaat qiling.",
-        "verification": "Activation must be backed by transaction verification before production billing.",
+        "verification": "Automatic BSC receipt verification is required before activation.",
     }
 
 
@@ -577,17 +689,65 @@ async def create_micro_order(buyer_wallet: str) -> dict[str, Any]:
         "pay_to_address": GENERAL_WALLET,
         "buyer_wallet": buyer_wallet,
         "instructions": "To‘lovdan keyin tx_hash yuboring; key berishdan oldin tranzaksiya tekshiriladi.",
-        "verification": "not_implemented",
+        "verification": "Automatic BSC receipt verification is required before activation.",
     }
 
 
+@app.post("/v1/verify-payment")
+async def verify_payment(payload: PaymentVerificationRequest) -> dict[str, Any]:
+    expected = Decimal("5.0") if payload.plan == "micro" else Decimal("19.0")
+    try:
+        result = await run_in_threadpool(
+            verify_bsc_payment_sync, payload.tx_hash, payload.buyer_wallet, expected
+        )
+    except Exception as exc:
+        record_metric("payment_verification_errors")
+        raise HTTPException(status_code=503, detail="BSC verification temporarily unavailable") from exc
+    record_metric("payment_verifications")
+    return {"plan": payload.plan, **result}
+
+
+@app.get("/v1/cfo/binance/balance")
+async def cfo_binance_balance(
+    asset: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_agent_key(authorization)
+    try:
+        result = await run_in_threadpool(binance_balances_sync, asset)
+    except Exception as exc:
+        record_metric("binance_balance_errors")
+        raise HTTPException(status_code=503, detail="Binance read-only balance check failed") from exc
+    record_metric("binance_balance_checks")
+    return {"agent": "CFO", "exchange": "Binance", **result}
+
+
 @app.post("/v1/activate-key")
-async def activate_key(tx_hash: str, buyer_wallet: str) -> dict[str, Any]:
-    # Do not issue paid access solely because an arbitrary tx_hash was submitted.
-    raise HTTPException(
-        status_code=501,
-        detail="On-chain transaction verification is not enabled yet; no key was issued.",
-    )
+async def activate_key(tx_hash: str, buyer_wallet: str, plan: str = "pro") -> dict[str, Any]:
+    if plan not in {"micro", "pro"}:
+        raise HTTPException(status_code=422, detail="plan must be micro or pro")
+    expected = Decimal("5.0") if plan == "micro" else Decimal("19.0")
+    try:
+        verification = await run_in_threadpool(verify_bsc_payment_sync, tx_hash, buyer_wallet, expected)
+    except Exception as exc:
+        record_metric("payment_verification_errors")
+        raise HTTPException(status_code=503, detail="BSC verification temporarily unavailable") from exc
+    if not verification.get("verified"):
+        raise HTTPException(status_code=402, detail={"message": "Payment not verified", **verification})
+    quota = MICRO_CREDIT_QUOTA if plan == "micro" else 50_000
+    new_key = f"ag_live_{uuid.uuid4().hex[:16]}"
+    with db_lock:
+        conn.execute(
+            "INSERT OR IGNORE INTO payment_verifications VALUES (?, ?, ?, ?, ?)",
+            (tx_hash, buyer_wallet, plan, str(expected), int(time.time())),
+        )
+        conn.execute(
+            "INSERT INTO api_keys VALUES (?, ?, ?, ?)",
+            (new_key, buyer_wallet, plan.upper(), quota),
+        )
+        conn.commit()
+    record_metric("payments_verified")
+    return {"status": "ACTIVATED", "api_key": new_key, "plan": plan, "requests_quota": quota, "verification": verification}
 
 
 @app.get("/", response_class=HTMLResponse)
