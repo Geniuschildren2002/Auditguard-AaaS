@@ -740,6 +740,11 @@ async def activate_key(tx_hash: str, buyer_wallet: str, plan: str = "pro") -> di
     quota = MICRO_CREDIT_QUOTA if plan == "micro" else 50_000
     new_key = f"ag_live_{uuid.uuid4().hex[:16]}"
     with db_lock:
+        already_activated = conn.execute(
+            "SELECT 1 FROM payment_verifications WHERE tx_hash = ?", (tx_hash,)
+        ).fetchone()
+        if already_activated:
+            raise HTTPException(status_code=409, detail="This payment transaction was already activated")
         conn.execute(
             "INSERT OR IGNORE INTO payment_verifications VALUES (?, ?, ?, ?, ?)",
             (tx_hash, buyer_wallet, plan, str(expected), int(time.time())),
