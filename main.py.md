@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - dependency is installed in deployment
     genai = None
 
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GENERAL_WALLET = os.getenv(
     "GENERAL_PAYOUT_WALLET",
@@ -37,6 +37,9 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 RATE_LIMIT_WINDOW_SECONDS = 60
 MICRO_CREDIT_PRICE_USDT = 5.0
 MICRO_CREDIT_QUOTA = 10_000
+PRO_MONTHLY_PRICE = 19.0
+ENTERPRISE_MIN_PRICE = 99.0
+ENTERPRISE_MAX_PRICE = 299.0
 
 if genai is not None and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -120,6 +123,15 @@ class AgentStatus(BaseModel):
 
 class AgentEvaluation(BaseModel):
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+
+
+class SalesLead(BaseModel):
+    company: str = Field(min_length=1, max_length=120)
+    industry: str = Field(min_length=1, max_length=80)
+    monthly_scans: int = Field(default=0, ge=0, le=10_000_000)
+    team_size: int = Field(default=1, ge=1, le=100_000)
+    compliance_required: bool = False
+    wants_sla: bool = False
 
 
 def record_metric(name: str, value: int = 1) -> None:
@@ -248,6 +260,7 @@ def agent_status(authorization: Optional[str] = Header(default=None)) -> list[Ag
         AgentStatus(name="CEO", role="Orchestration", status="active", capability="service-level status and operational reporting"),
         AgentStatus(name="CMO", role="Growth", status="informational", capability="landing page and public API documentation"),
         AgentStatus(name="PR/DevRel", role="Integrations", status="informational", capability="OpenAPI documentation and API examples"),
+        AgentStatus(name="CSO", role="Sales", status="active", capability="lead qualification, plan matching and ARR pipeline"),
     ]
 
 
@@ -257,7 +270,8 @@ def plans() -> dict[str, Any]:
         "currency": "USDT",
         "plans": [
             {"id": "micro", "price": MICRO_CREDIT_PRICE_USDT, "quota": MICRO_CREDIT_QUOTA, "period": "one-time"},
-            {"id": "pro", "price": 19.0, "quota": 50_000, "period": "monthly"},
+            {"id": "pro", "price": PRO_MONTHLY_PRICE, "quota": 50_000, "period": "monthly"},
+            {"id": "enterprise", "price_from": ENTERPRISE_MIN_PRICE, "price_to": ENTERPRISE_MAX_PRICE, "quota": "custom", "period": "monthly", "sla": True},
         ],
         "payment_verification": "On-chain verification is required before access activation.",
     }
@@ -266,6 +280,70 @@ def plans() -> dict[str, Any]:
 @app.get("/v1/industries")
 def industries() -> dict[str, Any]:
     return {"segments": ICP_SEGMENTS, "outreach": "not automated; use only with explicit consent"}
+
+
+@app.post("/v1/sales/qualify")
+def qualify_sales_lead(lead: SalesLead) -> dict[str, Any]:
+    """Score a lead and recommend a plan; does not contact or sign for anyone."""
+    score = 0
+    reasons = []
+    if lead.monthly_scans >= 50_000:
+        score += 45
+        reasons.append("high monthly scan volume")
+    elif lead.monthly_scans >= 10_000:
+        score += 25
+        reasons.append("growing monthly scan volume")
+    if lead.team_size >= 20:
+        score += 20
+        reasons.append("larger engineering team")
+    elif lead.team_size >= 5:
+        score += 10
+        reasons.append("multi-person team")
+    if lead.compliance_required:
+        score += 20
+        reasons.append("compliance requirement")
+    if lead.wants_sla:
+        score += 20
+        reasons.append("SLA requested")
+    if score >= 55:
+        plan = "enterprise"
+        next_step = "human_review"
+        offer = "$99–$299/month, custom quota and SLA discussion"
+    elif score >= 20:
+        plan = "pro"
+        next_step = "self_serve_trial"
+        offer = "$19/month, 50,000 scans"
+    else:
+        plan = "micro"
+        next_step = "free_or_micro_trial"
+        offer = "$5 one-time, 10,000 scans"
+    record_metric("sales_leads_qualified")
+    return {
+        "status": "qualified",
+        "company": lead.company,
+        "industry": lead.industry,
+        "score": score,
+        "recommended_plan": plan,
+        "offer": offer,
+        "reasons": reasons,
+        "next_step": next_step,
+        "disclaimer": "No external message, purchase, contract or payment was initiated.",
+    }
+
+
+@app.get("/v1/sales/pipeline")
+def sales_pipeline(authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_agent_key(authorization)
+    with _metrics_lock:
+        qualified = _metrics.get("sales_leads_qualified", 0)
+    return {
+        "agent": "CSO",
+        "qualified_leads_observed": qualified,
+        "target_arr": 100_000,
+        "pricing": {"pro_monthly": PRO_MONTHLY_PRICE, "enterprise_monthly_range": [ENTERPRISE_MIN_PRICE, ENTERPRISE_MAX_PRICE]},
+        "arr_formula": "pro_customers*19*12 + enterprise_customers*average_enterprise_price*12",
+        "revenue_claims": "No paid customers or ARR are claimed without verified data.",
+    }
 
 
 @app.get("/v1/benchmark")
@@ -346,6 +424,7 @@ async def evaluate_with_agent_swarm(
             "CFO": {"decision": "HOLD", "reason": "no payment action is performed by scan"},
             "CMO": {"decision": "OBSERVE", "reason": "no marketing action is performed by scan"},
             "PR/DevRel": {"decision": "DOCUMENT", "reason": "OpenAPI endpoint is available"},
+            "CSO": {"decision": "QUALIFY", "reason": "lead scoring requires lead data; no outreach is automated"},
         },
     }
 
