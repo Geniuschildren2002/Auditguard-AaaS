@@ -16,6 +16,7 @@ AuditGuard is a FastAPI service for PII redaction and prompt-injection defense.
 - Local leaked-key radar: `POST /v1/security/leaked-key-check`
 - Feedback loop: `POST /v1/feedback`
 - Payment verification: `POST /v1/verify-payment`
+- Public on-chain wallet status: `GET /v1/payment/status`
 - CFO Binance read-only balance: `GET /v1/cfo/binance/balance`
 
 ## SDKs
@@ -24,4 +25,4 @@ Publish-ready Python and JavaScript SDK source packages are in [`sdks/`](sdks/).
 
 ## Safety notes
 
-Payment verification checks BNB Smart Chain receipt status, USDT contract, sender, recipient, amount and confirmations before activation. Binance integration is strictly read-only and requires a restricted API key in `BINANCE_API_KEY`/`BINANCE_API_SECRET`; no withdrawal or transfer endpoint exists. The model failover is optional and requires a user-supplied `GROQ_API_KEY`. External marketing messages, GitHub scans and public benchmark claims are not automated; the leaked-key radar accepts supplied text only.
+The public landing page includes an interactive prompt scanner, live service status and a truthful on-chain wallet status panel. Payment verification checks BNB Smart Chain receipt status, USDT contract, sender, recipient, amount and confirmations before activation. Binance integration is strictly read-only and requires a restricted API key in `BINANCE_API_KEY`/`BINANCE_API_SECRET`; no withdrawal or transfer endpoint exists. The model failover is optional and requires a user-supplied `GROQ_API_KEY`. External marketing messages, GitHub scans and public benchmark claims are not automated; the leaked-key radar accepts supplied text only.
